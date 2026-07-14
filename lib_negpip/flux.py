@@ -67,6 +67,11 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             clean_prompts.append(clean_text.strip(" ,"))
             batch_neg_data.append(neg_data)
 
+        # Early exit: If no negative weights exist, run 100% natively with zero side-effects
+        if not has_neg:
+            return model.orig_flux_forward(prompt)
+
+        # 2. Safely preserve metadata (like .is_negative_prompt) for Forge compatibility
         def make_cond_obj(texts):
             if hasattr(prompt, "is_negative_prompt"):
                 new_obj = type(prompt)(texts)
@@ -76,25 +81,23 @@ def _hook_flux_learned_conditioning(model, remove: bool):
                 return new_obj
             return texts
 
-        # 2. Compile clean prompt (keeps the 'y' pooled vector pure for CFG 1.0)
+        # 3. Compile clean prompt (keeps the 'y' pooled vector pure for CFG 1.0)
         base_conds = model.orig_flux_forward(make_cond_obj(clean_prompts))
-        
-        if not has_neg:
-            return base_conds
 
+        # 4. Standardize the data structure securely without booleans
         is_dict_return = isinstance(base_conds, dict)
         is_tensor_return = isinstance(base_conds, torch.Tensor)
         
-        # 3. Use a Synthetic Wrapper for raw tensors so we can carry the mask safely
         if is_dict_return:
             cond_list = [base_conds]
         elif is_tensor_return:
-            cond_list = [{"_is_synthetic": True, "txt": base_conds}]
+            cond_list = [{"txt": base_conds}]
         else:
-            cond_list = [{"_is_synthetic": True, "txt": c} if isinstance(c, torch.Tensor) else c for c in base_conds]
+            cond_list = [{"txt": c} if isinstance(c, torch.Tensor) else c for c in base_conds]
 
         _count = 0
         
+        # 5. Process each batch item to append isolated negative embeddings safely
         for c_item in cond_list:
             if not isinstance(c_item, dict):
                 continue
@@ -119,8 +122,10 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             out_masks = []
             out_txt_ids = []
             
+            # Unpack the batch dimension to prevent token bleeding between prompts
             for idx in range(b):
                 neg_list = batch_neg_data[idx] if idx < len(batch_neg_data) else []
+                
                 txt_list = [base_txt[idx]]
                 mask_list = [torch.ones(base_seq_len, device=base_txt.device, dtype=base_txt.dtype)]
                 
@@ -144,6 +149,7 @@ def _hook_flux_learned_conditioning(model, remove: bool):
                             
                         w_seq_len = w_txt.shape[0]
                         txt_list.append(w_txt)
+                        
                         w_mask = torch.full((w_seq_len,), weight, device=base_txt.device, dtype=base_txt.dtype)
                         mask_list.append(w_mask)
                         _count += 1
@@ -160,6 +166,7 @@ def _hook_flux_learned_conditioning(model, remove: bool):
                 if has_txt_ids and len(txt_ids_list) == len(txt_list):
                     out_txt_ids.append(torch.cat(txt_ids_list, dim=0))
 
+            # Pad all batch items sequentially to prevent shape mismatch in batched generations
             max_len = max([t.shape[0] for t in out_txts])
             padded_txts = []
             padded_masks = []
@@ -273,33 +280,11 @@ def _hook_flux_compile_conditions(remove: bool):
         if cond is None:
             return None
 
-        synthetic_masks = []
-
-        # 1. Unwrap Synthetic Dicts before Forge sees them to prevent KeyError crashes
-        if isinstance(cond, dict) and cond.get("_is_synthetic"):
-            synthetic_masks.append(cond["c_negpip_mask"])
-            cond = cond["txt"]
-        elif isinstance(cond, list):
-            new_cond = []
-            for c_item in cond:
-                if isinstance(c_item, dict) and c_item.get("_is_synthetic"):
-                    synthetic_masks.append(c_item["c_negpip_mask"])
-                    new_cond.append(c_item["txt"])
-                else:
-                    new_cond.append(c_item)
-            cond = new_cond
-
-        # 2. Safely call native Forge compiler with exactly the type it expects
+        # 1. Forge safely compiles the dictionary (ignoring unknown keys like our mask)
         compiled = condition.orig_flux_forward(cond)
         
-        # 3. Inject masks into the final compiled objects
-        if synthetic_masks:
-            for i, c in enumerate(compiled):
-                if isinstance(c, dict) and "model_conds" in c:
-                    m = synthetic_masks[i] if i < len(synthetic_masks) else synthetic_masks[-1]
-                    c["model_conds"]["c_negpip_mask"] = condition.Condition(m)
-                    
-        elif isinstance(cond, dict) and "c_negpip_mask" in cond:
+        # 2. Extract our mask from the uncompiled dict and safely inject it into the compiled model_conds
+        if isinstance(cond, dict) and "c_negpip_mask" in cond:
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
                     c["model_conds"]["c_negpip_mask"] = condition.Condition(cond["c_negpip_mask"])
