@@ -26,6 +26,7 @@ def patch_flux_negpip(cls: "NegPiP", *, unpatch=False):
     _hook_flux_dit_forward(dit, unpatch)
     _hook_flux_compile_conditions(unpatch)
 
+
 def _hook_flux_learned_conditioning(model, remove: bool):
     if remove:
         if hasattr(model, "orig_flux_forward"):
@@ -44,67 +45,57 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         _count = 0
 
         def process_tensor(txt_tensor):
-            nonlocal _count
             if txt_tensor.ndim == 2:
                 txt_tensor = txt_tensor.unsqueeze(0)
                 
             b, l, d = txt_tensor.shape
             out_txt = []
             out_mask = []
+            tokens_found = 0
             
             for i in range(b):
                 line = prompt[i] if i < len(prompt) else prompt[-1]
                 mask = _build_flux_negpip_mask(engine, line, l, txt_tensor.device, txt_tensor.dtype)
-                _count += int((mask < 0).sum())
+                tokens_found += int((mask < 0).sum())
                 
                 out_txt.append(txt_tensor[i] * mask.unsqueeze(-1))
                 out_mask.append(mask.unsqueeze(-1))
                 
-            return torch.stack(out_txt, dim=0), torch.stack(out_mask, dim=0)
+            return torch.stack(out_txt, dim=0), torch.stack(out_mask, dim=0), tokens_found
 
+        # 1. Safely process the tensor natively without renaming keys to trick Forge
         if isinstance(conds, dict):
-            txt_key = "crossattn" if "crossattn" in conds else "txt"
-            if txt_key in conds and conds[txt_key] is not None:
-                new_txt, mask = process_tensor(conds[txt_key])
-                conds[txt_key] = new_txt
-                conds["c_negpip_mask"] = mask
-            
-            if _count > 0:
-                print(f"NegPiP Flux Enable (Tokens: {_count})")
-            return conds
+            for k in ["txt", "crossattn"]:
+                if k in conds and conds[k] is not None:
+                    conds[k], mask, c = process_tensor(conds[k])
+                    conds["c_negpip_mask"] = mask
+                    _count += c
+                    break
 
         elif isinstance(conds, list):
-            new_conds = []
-            for cond in conds:
-                if isinstance(cond, dict):
-                    txt_key = "crossattn" if "crossattn" in cond else "txt"
-                    if txt_key in cond and cond[txt_key] is not None:
-                        new_txt, mask = process_tensor(cond[txt_key])
-                        cond[txt_key] = new_txt
-                        cond["c_negpip_mask"] = mask
-                    new_conds.append(cond)
-                elif isinstance(cond, torch.Tensor):
-                    new_txt, mask = process_tensor(cond)
-                    new_conds.append({
-                        "crossattn": new_txt,
-                        "c_negpip_mask": mask
-                    })
-                else:
-                    new_conds.append(cond)
-                    
-            if _count > 0:
-                print(f"NegPiP Flux Enable (Tokens: {_count})")
-            return new_conds
+            for c_item in conds:
+                if isinstance(c_item, dict):
+                    for k in ["txt", "crossattn"]:
+                        if k in c_item and c_item[k] is not None:
+                            c_item[k], mask, c = process_tensor(c_item[k])
+                            c_item["c_negpip_mask"] = mask
+                            _count += c
+                            break
 
         elif isinstance(conds, torch.Tensor):
-            new_txt, mask = process_tensor(conds)
-            if _count > 0:
-                print(f"NegPiP Flux Enable (Tokens: {_count})")
-            return [{"crossattn": new_txt, "c_negpip_mask": mask}]
-            
+            new_txt, mask, c = process_tensor(conds)
+            _count += c
+            # Wrap as "txt" (Flux spec) instead of "crossattn" to prevent KeyError: 'vector'
+            conds = {"txt": new_txt, "c_negpip_mask": mask}
+
+        if _count > 0:
+            key = "Negative" if getattr(prompt, "is_negative_prompt", False) else "Positive"
+            print(f"NegPiP Flux Enable ({key}: {_count})")
+
         return conds
 
     model.get_learned_conditioning = negpip_flux_conditioning
+
 
 def _build_flux_negpip_mask(engine, line: str, token_length: int, device, dtype):
     if not engine:
@@ -130,6 +121,7 @@ def _build_flux_negpip_mask(engine, line: str, token_length: int, device, dtype)
         mask = mask[:token_length]
 
     return mask
+
 
 def _hook_flux_dit_forward(dit, remove: bool):
     if remove:
@@ -161,6 +153,7 @@ def _hook_flux_dit_forward(dit, remove: bool):
     negpip_forward._negpip = True
     dit.forward = negpip_forward
 
+
 def _hook_flux_compile_conditions(remove: bool):
     if remove:
         if hasattr(condition, "orig_flux_forward"):
@@ -176,48 +169,15 @@ def _hook_flux_compile_conditions(remove: bool):
         if cond is None:
             return None
 
-        # 1. Aggressive Bypass: Intercept ANY dict or list containing our mask
-        is_our_dict = isinstance(cond, dict) and "c_negpip_mask" in cond
-        is_our_list = isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], dict) and "c_negpip_mask" in cond[0]
-
-        if is_our_dict or is_our_list:
-            cond_list = [cond] if is_our_dict else cond
-            compiled = []
-            
-            for c_item in cond_list:
-                # Find the main text embeddings (Forge uses crossattn internally for Flux context)
-                txt = c_item.get("crossattn", c_item.get("txt"))
-                
-                model_conds = {
-                    "c_negpip_mask": condition.Condition(c_item["c_negpip_mask"])
-                }
-                
-                if txt is not None:
-                    model_conds["c_crossattn"] = condition.ConditionCrossAttn(txt)
-                    
-                # Carry over any extra conditioning kwargs needed by Flux (y, txt_ids, etc.)
-                # This ensures we don't drop essential Flux architecture keys while bypassing SDXL fallback
-                for key in ["y", "txt_ids", "img_ids", "guidance"]:
-                    if key in c_item:
-                        model_conds[key] = condition.Condition(c_item[key])
-                        
-                # Construct the final compiled item exactly as Forge's sampler expects
-                compiled_item = {"model_conds": model_conds}
-                if txt is not None:
-                    compiled_item["crossattn"] = txt
-                    
-                compiled.append(compiled_item)
-                
-            return compiled
-
-        # 2. For all native dictionaries (where NegPiP isn't active), proceed with standard compilation
+        # 1. ALWAYS let Forge compile the object natively. No synthetic chunking bypasses.
         compiled = condition.orig_flux_forward(cond)
         
-        # 3. Post-injection fallback just in case
+        # 2. Gently inject the mask directly into the compiled model_conds object
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
                     c["model_conds"]["c_negpip_mask"] = condition.Condition(cond["c_negpip_mask"])
+                    
         elif isinstance(cond, list):
             for i, c_item in enumerate(cond):
                 if isinstance(c_item, dict) and "c_negpip_mask" in c_item:
