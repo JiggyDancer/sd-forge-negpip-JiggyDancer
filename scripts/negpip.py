@@ -116,10 +116,7 @@ class NegPiP(scripts.Script):
                 elif self.is_flux:
                     from lib_negpip.flux import patch_flux_negpip
                     patch_flux_negpip(NegPiP)
-                    
-                    if p.cfg_scale <= 1.0:
-                        print("NegPiP: Flux model detected. Overriding CFG scale to 1.1.")
-                        p.cfg_scale = 1.1
+                    # CFG 1.1 override completely removed
 
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
@@ -226,58 +223,39 @@ class NegPiP(scripts.Script):
     def _getScheduledNegPip(
         prompts: list[str], steps: list[int]
     ) -> list[list[tuple[int, list[tuple[str, float]]]]]:
-        """extract the prompts with negative weights"""
-
         output = []
-
         scheduled = get_learned_conditioning_prompt_schedules(prompts, steps)
         for i, batch_schedule in enumerate(scheduled):
             stepout = []
-
             for step, prompt in batch_schedule:
                 neg_matches: list[str] = re.findall(NEG_PATTERN, prompt)
                 neg_targets = []
-
                 for minusmatch in neg_matches:
                     prompts[i] = prompts[i].replace(minusmatch, "")
                     neg_targets.append(minusmatch.strip("(").strip(")"))
-
                 neg_targets: list[tuple[str, str]] = [x.split(":") for x in neg_targets]
                 text_weights: list[tuple[str, float]] = []
-
                 for text, weight in neg_targets:
                     if text.strip() in ("BREAK", "AND", "ADDCOL", "ADDROW"):
                         continue
                     if (weight := float(weight)) < 0.0:
                         text_weights.append((text, weight))
-
                 stepout.append((step, text_weights))
-
             output.append(stepout)
-
         return output
 
     def _cond_dealer(
         self, p: "StableDiffusionProcessing", target: tuple[str, float]
     ) -> tuple[torch.Tensor, int]:
         conds = []
-
-        input = SdConditioning(
-            [f"({target[0]}:{-target[1]})"],
-            width=p.width,
-            height=p.height,
-        )
-
+        input = SdConditioning([f"({target[0]}:{-target[1]})"], width=p.width, height=p.height)
         cond = get_learned_conditioning(p.sd_model, input, p.steps)
-
         _, token_len = self.tokenizer(target[0])
-
         conds.append(
             cond[0][0].cond[1 : token_len + 2, :]
             if not self.is_xl
             else cond[0][0].cond["crossattn"][1 : token_len + 2, :]
         )
-
         conds = torch.cat(conds, 0).unsqueeze(0)
         return conds.repeat(self.batch_size, 1, 1), conds.shape[1]
 
