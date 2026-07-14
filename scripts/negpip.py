@@ -30,16 +30,15 @@ def _verify_ext(p: "StableDiffusionProcessing"):
 
 
 class NegPiP(scripts.Script):
-    # Updated to 3 booleans to track SD, Anima, and Flux patching states
     _patched: list[bool] = [False, False, False]
 
     def __init__(self):
         self.active: bool = False
 
-        self.is_xl: bool
-        self.is_anima: bool
-        self.is_hr: bool
-        self.is_flux: bool
+        self.is_xl: bool = False
+        self.is_anima: bool = False
+        self.is_hr: bool = False
+        self.is_flux: bool = False
 
         self.tokenizer: torch.nn.Module
 
@@ -85,9 +84,8 @@ class NegPiP(scripts.Script):
         patch_sd_negpip(None, NegPiP, unpatch=True)
         patch_anima_negpip(NegPiP, unpatch=True)
         
-        # Ensure Flux unpatches cleanly on reset
         from lib_negpip.flux import patch_flux_negpip
-        patch_flux_negpip(NegPiP, unpatch=True)
+        patch_flux_negpip(None, NegPiP, unpatch=True)
 
     def title(self):
         return "NegPiP"
@@ -113,21 +111,17 @@ class NegPiP(scripts.Script):
             self.is_anima = model_name == "Anima"
             self.is_flux = "Flux" in model_name or "Klein" in model_name
 
-            if self.is_anima or self.is_flux:
-                if self.is_anima:
-                    patch_anima_negpip(NegPiP)
-                elif self.is_flux:
-                    from lib_negpip.flux import patch_flux_negpip
-                    patch_flux_negpip(NegPiP)
-                    # Note: CFG 1.1 Override intentionally removed here to preserve 
-                    # Flux's native CFG 1.0 performance speed.
-
+            # Anima handles prompt parsing internally, so it exits the pipeline early.
+            # Flux requires the standard token parsing pipeline, so it must continue!
+            if self.is_anima:
+                patch_anima_negpip(NegPiP)
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
                 self.active = True
-            return
+                return
+        else:
+            self.is_xl = p.sd_model.is_sdxl
 
-        self.is_xl = p.sd_model.is_sdxl
         self.batch_size = p.batch_size
         self.has_hr_p, self.has_hr_n = hr_dealer(p)
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
@@ -167,7 +161,13 @@ class NegPiP(scripts.Script):
         self.c_len = calcChunks(self.tokenizer(p.prompts[0])[1], 75)
         self.uc_len = calcChunks(self.tokenizer(p.negative_prompts[0])[1], 75)
 
-        patch_sd_negpip(self, NegPiP)
+        # Apply specific patchers for Flux vs SD1.5/SDXL
+        if getattr(self, "is_flux", False):
+            from lib_negpip.flux import patch_flux_negpip
+            patch_flux_negpip(self, NegPiP)
+        else:
+            patch_sd_negpip(self, NegPiP)
+
         reset_prompt_cache(p)
         p.extra_generation_params["NegPiP"] = True
         self.active = True
@@ -184,7 +184,7 @@ class NegPiP(scripts.Script):
         self.is_hr = True
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if (not self.active) or self.is_anima or self.is_flux:
+        if (not self.active) or getattr(self, "is_anima", False):
             return
 
         conds_list = []
@@ -257,27 +257,19 @@ class NegPiP(scripts.Script):
         )
         cond = get_learned_conditioning(p.sd_model, input, p.steps)
         _, token_len = self.tokenizer(target[0])
-        conds.append(
-            cond[0][0].cond[1 : token_len + 2, :]
-            if not self.is_xl
-            else cond[0][0].cond["crossattn"][1 : token_len + 2, :]
-        )
+        
+        c = cond[0][0].cond
+        if getattr(self, "is_flux", False):
+            if isinstance(c, dict):
+                c_tensor = c.get("crossattn", c.get("txt"))
+            else:
+                c_tensor = c
+            # Flux Qwen3/T5 embeddings extracted safely
+            conds.append(c_tensor[0 : token_len + 2, :])
+        elif getattr(self, "is_xl", False):
+            conds.append(c["crossattn"][1 : token_len + 2, :])
+        else:
+            conds.append(c[1 : token_len + 2, :])
+
         conds = torch.cat(conds, 0).unsqueeze(0)
         return conds.repeat(self.batch_size, 1, 1), conds.shape[1]
-
-    def _calc_conds(
-        self,
-        p: "StableDiffusionProcessing",
-        targetlist: list[list[tuple[int, list[tuple[str, float]]]]],
-    ) -> list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]:
-        outconds = []
-        for batch in targetlist:
-            stepconds = []
-            for step, regions in batch:
-                regionconds = []
-                for targets in regions:
-                    conds, c_tokens = self._cond_dealer(p, targets)
-                    regionconds.append((conds, c_tokens))
-                stepconds.append((step, regionconds))
-            outconds.append(stepconds)
-        return outconds
