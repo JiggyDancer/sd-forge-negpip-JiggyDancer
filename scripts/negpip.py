@@ -30,7 +30,7 @@ def _verify_ext(p: " StableDiffusionProcessing"):
 
 
 class NegPiP(scripts.Script):
-    _patched: list[bool] = [False, False]
+    _patched: list[bool] = [False, False, False]
 
     def __init__(self):
         self.active: bool = False
@@ -38,6 +38,7 @@ class NegPiP(scripts.Script):
         self.is_xl: bool
         self.is_anima: bool
         self.is_hr: bool
+        self.is_flux: bool
 
         self.tokenizer: torch.nn.Module
 
@@ -66,6 +67,7 @@ class NegPiP(scripts.Script):
         self.is_xl = False
         self.is_anima = False
         self.is_hr = False
+        self.is_flux = False
 
         self.tokenizer = None
 
@@ -81,6 +83,8 @@ class NegPiP(scripts.Script):
 
         patch_sd_negpip(None, NegPiP, unpatch=True)
         patch_anima_negpip(NegPiP, unpatch=True)
+        from lib_negpip.flux import patch_flux_negpip
+        patch_flux_negpip(NegPiP, unpatch=True)
 
     def title(self):
         return "NegPiP"
@@ -102,9 +106,21 @@ class NegPiP(scripts.Script):
             return
 
         if IS_NEO and not p.sd_model.is_webui_legacy_model():
-            self.is_anima = type(p.sd_model).__name__ == "Anima"
-            if self.is_anima:
-                patch_anima_negpip(NegPiP)
+            model_name = type(p.sd_model).__name__
+            self.is_anima = model_name == "Anima"
+            self.is_flux = "Flux" in model_name or "Klein" in model_name
+
+            if self.is_anima or self.is_flux:
+                if self.is_anima:
+                    patch_anima_negpip(NegPiP)
+                elif self.is_flux:
+                    from lib_negpip.flux import patch_flux_negpip
+                    patch_flux_negpip(NegPiP)
+                    
+                    if p.cfg_scale <= 1.0:
+                        print("NegPiP: Flux model detected. Overriding CFG scale to 1.1.")
+                        p.cfg_scale = 1.1
+
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
                 self.active = True
@@ -167,7 +183,7 @@ class NegPiP(scripts.Script):
         self.is_hr = True
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if (not self.active) or self.is_anima:
+        if (not self.active) or self.is_anima or self.is_flux:
             return
 
         conds_list = []
