@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 
 from backend.sampling import condition, sampling_function
 from modules import shared
@@ -42,55 +41,71 @@ def _hook_flux_learned_conditioning(model, remove: bool):
     def negpip_flux_conditioning(prompt):
         conds = model.orig_flux_forward(prompt)
         
-        crossattn = []
-        negpip_mask = []
         _count = 0
 
-        iterable_conds = conds if isinstance(conds, list) else [conds]
-
-        for line, cond in zip(prompt, iterable_conds):
-            if isinstance(cond, dict):
-                cond_data = cond.get("crossattn", cond.get("txt", None))
-            elif isinstance(cond, torch.Tensor):
-                cond_data = cond
-            else:
-                cond_data = None
-
-            if cond_data is None:
-                continue
-
-            cond_data = cond_data.reshape(-1, cond_data.shape[-1])
+        # Helper to process tensors while maintaining exact (Batch, Seq, Dim) shapes
+        def process_tensor(txt_tensor):
+            nonlocal _count
+            if txt_tensor.ndim == 2:
+                txt_tensor = txt_tensor.unsqueeze(0)
+                
+            b, l, d = txt_tensor.shape
+            out_txt = []
+            out_mask = []
             
-            mask = _build_flux_negpip_mask(
-                engine,
-                line,
-                cond_data.shape[0],
-                cond_data.device,
-                cond_data.dtype,
-            )
+            for i in range(b):
+                # Ensure we match the prompt to the batch index safely
+                line = prompt[i] if i < len(prompt) else prompt[-1]
+                mask = _build_flux_negpip_mask(engine, line, l, txt_tensor.device, txt_tensor.dtype)
+                _count += int((mask < 0).sum())
+                
+                out_txt.append(txt_tensor[i] * mask.unsqueeze(-1))
+                out_mask.append(mask.unsqueeze(-1))
+                
+            return torch.stack(out_txt, dim=0), torch.stack(out_mask, dim=0)
 
-            _count += int((mask < 0).sum())
-            crossattn.append(cond_data * mask.unsqueeze(-1).to(cond_data))
-            negpip_mask.append(mask.unsqueeze(-1).to(cond_data))
+        # Preserve the exact return type (Dict or List) so Forge doesn't crash downstream
+        if isinstance(conds, dict):
+            txt_key = "crossattn" if "crossattn" in conds else "txt"
+            if txt_key in conds and conds[txt_key] is not None:
+                new_txt, mask = process_tensor(conds[txt_key])
+                conds[txt_key] = new_txt
+                conds["c_negpip_mask"] = mask
+            
+            if _count > 0:
+                print(f"NegPiP Flux Enable (Tokens: {_count})")
+            return conds
 
-        if _count > 0:
-            key = "Negative" if prompt.is_negative_prompt else "Positive"
-            print(f"NegPiP Flux Enable ({key}: {_count})")
+        elif isinstance(conds, list):
+            new_conds = []
+            for cond in conds:
+                if isinstance(cond, dict):
+                    txt_key = "crossattn" if "crossattn" in cond else "txt"
+                    if txt_key in cond and cond[txt_key] is not None:
+                        new_txt, mask = process_tensor(cond[txt_key])
+                        cond[txt_key] = new_txt
+                        cond["c_negpip_mask"] = mask
+                    new_conds.append(cond)
+                elif isinstance(cond, torch.Tensor):
+                    new_txt, mask = process_tensor(cond)
+                    new_conds.append({
+                        "crossattn": new_txt,
+                        "c_negpip_mask": mask
+                    })
+                else:
+                    new_conds.append(cond)
+                    
+            if _count > 0:
+                print(f"NegPiP Flux Enable (Tokens: {_count})")
+            return new_conds
 
-        result = conds[0] if isinstance(conds, list) else conds
-        
-        if isinstance(result, dict):
-            if "crossattn" in result:
-                result["crossattn"] = torch.stack(crossattn, dim=0)
-            elif "txt" in result:
-                result["txt"] = torch.stack(crossattn, dim=0)
-            result["c_negpip_mask"] = torch.stack(negpip_mask, dim=0)
-            return [result]
-        else:
-            return [{
-                "crossattn": torch.stack(crossattn, dim=0),
-                "c_negpip_mask": torch.stack(negpip_mask, dim=0),
-            }]
+        elif isinstance(conds, torch.Tensor):
+            new_txt, mask = process_tensor(conds)
+            if _count > 0:
+                print(f"NegPiP Flux Enable (Tokens: {_count})")
+            return [{"crossattn": new_txt, "c_negpip_mask": mask}]
+            
+        return conds
 
     model.get_learned_conditioning = negpip_flux_conditioning
 
@@ -110,6 +125,7 @@ def _build_flux_negpip_mask(engine, line: str, token_length: int, device, dtype)
     weights = torch.tensor(multipliers, device=device, dtype=dtype)
     ones = torch.ones_like(weights)
     
+    # Dampen the negative weights for Qwen3 to prevent image deep-frying
     mask = torch.where(weights < 0, weights * 0.5, ones)
 
     if mask.shape[0] < token_length:
@@ -133,20 +149,17 @@ def _hook_flux_dit_forward(dit, remove: bool):
     @wraps(dit.orig_flux_forward)
     def negpip_forward(*args, **kwargs):
         transformer_options = kwargs.get("transformer_options", {})
-        
-        # Safely pop the mask out of the kwargs (which come from Forge's extra_conds)
         negpip_mask = kwargs.pop("c_negpip_mask", None)
 
         if negpip_mask is not None:
-            # Rebuild the dict to avoid modifying defaults or shared memory references
             if transformer_options is None:
                 transformer_options = {}
             else:
                 transformer_options = dict(transformer_options)
                 
             transformer_options["negpip_mask"] = negpip_mask
+            kwargs["transformer_options"] = transformer_options
             
-        kwargs["transformer_options"] = transformer_options
         return dit.orig_flux_forward(*args, **kwargs)
 
     negpip_forward._negpip = True
@@ -167,20 +180,21 @@ def _hook_flux_compile_conditions(remove: bool):
         if cond is None:
             return None
 
+        # 1. Let Forge do the heavy lifting and compile everything natively first
+        compiled = condition.orig_flux_forward(cond)
+        
+        # 2. Inject our mask back into the compiled object if it exists
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
-            if "crossattn" in cond and "vector" not in cond:
-                cross_attn = cond["crossattn"]
-                model_conds = {"c_crossattn": condition.ConditionCrossAttn(cross_attn)}
-                model_conds["c_negpip_mask"] = condition.Condition(cond["c_negpip_mask"])
-                return [dict(cross_attn=cross_attn, model_conds=model_conds)]
-            
-            compiled = condition.orig_flux_forward(cond)
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
                     c["model_conds"]["c_negpip_mask"] = condition.Condition(cond["c_negpip_mask"])
-            return compiled
+        elif isinstance(cond, list):
+            for i, c_item in enumerate(cond):
+                if isinstance(c_item, dict) and "c_negpip_mask" in c_item:
+                    if i < len(compiled) and isinstance(compiled[i], dict) and "model_conds" in compiled[i]:
+                        compiled[i]["model_conds"]["c_negpip_mask"] = condition.Condition(c_item["c_negpip_mask"])
 
-        return condition.orig_flux_forward(cond)
+        return compiled
 
     condition.compile_conditions = compile_conditions
     sampling_function.compile_conditions = compile_conditions
