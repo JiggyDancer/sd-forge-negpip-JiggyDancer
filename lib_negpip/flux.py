@@ -176,24 +176,44 @@ def _hook_flux_compile_conditions(remove: bool):
         if cond is None:
             return None
 
-        # 1. Bypass Forge's compiler if we are dealing with our synthetic dictionary
-        # This prevents the KeyError: 'vector' crash entirely.
-        if isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], dict):
-            if "c_negpip_mask" in cond[0] and "crossattn" in cond[0] and "vector" not in cond[0] and "y" not in cond[0]:
-                compiled = []
-                for c_item in cond:
-                    txt = c_item["crossattn"]
-                    model_conds = {
-                        "c_crossattn": condition.ConditionCrossAttn(txt),
-                        "c_negpip_mask": condition.Condition(c_item["c_negpip_mask"])
-                    }
-                    compiled.append({"crossattn": txt, "model_conds": model_conds})
-                return compiled
+        # 1. Aggressive Bypass: Intercept ANY dict or list containing our mask
+        is_our_dict = isinstance(cond, dict) and "c_negpip_mask" in cond
+        is_our_list = isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], dict) and "c_negpip_mask" in cond[0]
 
-        # 2. For all native dictionaries, proceed with standard compilation
+        if is_our_dict or is_our_list:
+            cond_list = [cond] if is_our_dict else cond
+            compiled = []
+            
+            for c_item in cond_list:
+                # Find the main text embeddings (Forge uses crossattn internally for Flux context)
+                txt = c_item.get("crossattn", c_item.get("txt"))
+                
+                model_conds = {
+                    "c_negpip_mask": condition.Condition(c_item["c_negpip_mask"])
+                }
+                
+                if txt is not None:
+                    model_conds["c_crossattn"] = condition.ConditionCrossAttn(txt)
+                    
+                # Carry over any extra conditioning kwargs needed by Flux (y, txt_ids, etc.)
+                # This ensures we don't drop essential Flux architecture keys while bypassing SDXL fallback
+                for key in ["y", "txt_ids", "img_ids", "guidance"]:
+                    if key in c_item:
+                        model_conds[key] = condition.Condition(c_item[key])
+                        
+                # Construct the final compiled item exactly as Forge's sampler expects
+                compiled_item = {"model_conds": model_conds}
+                if txt is not None:
+                    compiled_item["crossattn"] = txt
+                    
+                compiled.append(compiled_item)
+                
+            return compiled
+
+        # 2. For all native dictionaries (where NegPiP isn't active), proceed with standard compilation
         compiled = condition.orig_flux_forward(cond)
         
-        # 3. Inject our mask back into the native compiled object
+        # 3. Post-injection fallback just in case
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
