@@ -19,7 +19,7 @@ from modules.prompt_parser import (
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
 
 
-def _verify_ext(p: " StableDiffusionProcessing"):
+def _verify_ext(p: "StableDiffusionProcessing"):
     for ext in p.scripts.scripts:
         if ext.title() not in INCOMPATIBLE_EXTENSIONS:
             continue
@@ -30,6 +30,7 @@ def _verify_ext(p: " StableDiffusionProcessing"):
 
 
 class NegPiP(scripts.Script):
+    # Updated to 3 booleans to track SD, Anima, and Flux patching states
     _patched: list[bool] = [False, False, False]
 
     def __init__(self):
@@ -83,6 +84,8 @@ class NegPiP(scripts.Script):
 
         patch_sd_negpip(None, NegPiP, unpatch=True)
         patch_anima_negpip(NegPiP, unpatch=True)
+        
+        # Ensure Flux unpatches cleanly on reset
         from lib_negpip.flux import patch_flux_negpip
         patch_flux_negpip(NegPiP, unpatch=True)
 
@@ -116,6 +119,8 @@ class NegPiP(scripts.Script):
                 elif self.is_flux:
                     from lib_negpip.flux import patch_flux_negpip
                     patch_flux_negpip(NegPiP)
+                    # Note: CFG 1.1 Override intentionally removed here to preserve 
+                    # Flux's native CFG 1.0 performance speed.
 
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
@@ -247,7 +252,9 @@ class NegPiP(scripts.Script):
         self, p: "StableDiffusionProcessing", target: tuple[str, float]
     ) -> tuple[torch.Tensor, int]:
         conds = []
-        input = SdConditioning([f"({target[0]}:{-target[1]})"], width=p.width, height=p.height)
+        input = SdConditioning(
+            [f"({target[0]}:{-target[1]})"], width=p.width, height=p.height
+        )
         cond = get_learned_conditioning(p.sd_model, input, p.steps)
         _, token_len = self.tokenizer(target[0])
         conds.append(
