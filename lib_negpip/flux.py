@@ -46,8 +46,18 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         negpip_mask = []
         _count = 0
 
-        for line, cond in zip(prompt, conds if isinstance(conds, list) else [conds]):
-            cond_data = cond.get("crossattn", cond.get("txt", None))
+        # conds could be a single Tensor, a list of Tensors, or a dict.
+        iterable_conds = conds if isinstance(conds, list) else [conds]
+
+        for line, cond in zip(prompt, iterable_conds):
+            # Handle both Tensor and Dict formats returned by Forge Neo
+            if isinstance(cond, dict):
+                cond_data = cond.get("crossattn", cond.get("txt", None))
+            elif isinstance(cond, torch.Tensor):
+                cond_data = cond
+            else:
+                cond_data = None
+
             if cond_data is None:
                 continue
 
@@ -69,14 +79,22 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             key = "Negative" if prompt.is_negative_prompt else "Positive"
             print(f"NegPiP Flux Enable ({key}: {_count})")
 
+        # Reconstruct the output depending on what the base model originally returned
         result = conds[0] if isinstance(conds, list) else conds
-        if "crossattn" in result:
-            result["crossattn"] = torch.stack(crossattn, dim=0)
-        elif "txt" in result:
-            result["txt"] = torch.stack(crossattn, dim=0)
-            
-        result["c_negpip_mask"] = torch.stack(negpip_mask, dim=0)
-        return [result]
+        
+        if isinstance(result, dict):
+            if "crossattn" in result:
+                result["crossattn"] = torch.stack(crossattn, dim=0)
+            elif "txt" in result:
+                result["txt"] = torch.stack(crossattn, dim=0)
+            result["c_negpip_mask"] = torch.stack(negpip_mask, dim=0)
+            return [result]
+        else:
+            # If it was a raw Tensor, wrap it in a dict with the mask so the compiler catches it
+            return [{
+                "crossattn": torch.stack(crossattn, dim=0),
+                "c_negpip_mask": torch.stack(negpip_mask, dim=0),
+            }]
 
     model.get_learned_conditioning = negpip_flux_conditioning
 
@@ -146,6 +164,13 @@ def _hook_flux_compile_conditions(remove: bool):
             return None
 
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
+            # Only compile if 'crossattn' is present to avoid crashing on pure mask dicts
+            if "crossattn" in cond and "vector" not in cond:
+                cross_attn = cond["crossattn"]
+                model_conds = {"c_crossattn": condition.ConditionCrossAttn(cross_attn)}
+                model_conds["c_negpip_mask"] = condition.Condition(cond["c_negpip_mask"])
+                return [dict(cross_attn=cross_attn, model_conds=model_conds)]
+            
             compiled = condition.orig_flux_forward(cond)
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
