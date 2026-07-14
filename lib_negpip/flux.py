@@ -46,11 +46,9 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         negpip_mask = []
         _count = 0
 
-        # conds could be a single Tensor, a list of Tensors, or a dict.
         iterable_conds = conds if isinstance(conds, list) else [conds]
 
         for line, cond in zip(prompt, iterable_conds):
-            # Handle both Tensor and Dict formats returned by Forge Neo
             if isinstance(cond, dict):
                 cond_data = cond.get("crossattn", cond.get("txt", None))
             elif isinstance(cond, torch.Tensor):
@@ -79,7 +77,6 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             key = "Negative" if prompt.is_negative_prompt else "Positive"
             print(f"NegPiP Flux Enable ({key}: {_count})")
 
-        # Reconstruct the output depending on what the base model originally returned
         result = conds[0] if isinstance(conds, list) else conds
         
         if isinstance(result, dict):
@@ -90,7 +87,6 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             result["c_negpip_mask"] = torch.stack(negpip_mask, dim=0)
             return [result]
         else:
-            # If it was a raw Tensor, wrap it in a dict with the mask so the compiler catches it
             return [{
                 "crossattn": torch.stack(crossattn, dim=0),
                 "c_negpip_mask": torch.stack(negpip_mask, dim=0),
@@ -135,15 +131,23 @@ def _hook_flux_dit_forward(dit, remove: bool):
 
     @torch.inference_mode()
     @wraps(dit.orig_flux_forward)
-    def negpip_forward(x, img_ids, txt, txt_ids, y, timesteps=None, guidance=None, **kwargs):
+    def negpip_forward(*args, **kwargs):
         transformer_options = kwargs.get("transformer_options", {})
+        
+        # Safely pop the mask out of the kwargs (which come from Forge's extra_conds)
         negpip_mask = kwargs.pop("c_negpip_mask", None)
 
         if negpip_mask is not None:
+            # Rebuild the dict to avoid modifying defaults or shared memory references
+            if transformer_options is None:
+                transformer_options = {}
+            else:
+                transformer_options = dict(transformer_options)
+                
             transformer_options["negpip_mask"] = negpip_mask
             
         kwargs["transformer_options"] = transformer_options
-        return dit.orig_flux_forward(x, img_ids, txt, txt_ids, y, timesteps, guidance, **kwargs)
+        return dit.orig_flux_forward(*args, **kwargs)
 
     negpip_forward._negpip = True
     dit.forward = negpip_forward
@@ -164,7 +168,6 @@ def _hook_flux_compile_conditions(remove: bool):
             return None
 
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
-            # Only compile if 'crossattn' is present to avoid crashing on pure mask dicts
             if "crossattn" in cond and "vector" not in cond:
                 cross_attn = cond["crossattn"]
                 model_conds = {"c_crossattn": condition.ConditionCrossAttn(cross_attn)}
