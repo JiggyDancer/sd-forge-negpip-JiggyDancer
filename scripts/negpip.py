@@ -83,7 +83,8 @@ class NegPiP(scripts.Script):
         patch_anima_negpip(NegPiP, unpatch=True)
         
         from lib_negpip.flux import patch_flux_negpip
-        patch_flux_negpip(None, NegPiP, unpatch=True)
+        # FIXED: Now matches the single-argument signature
+        patch_flux_negpip(NegPiP, unpatch=True)
 
     def title(self):
         return "NegPiP"
@@ -109,14 +110,13 @@ class NegPiP(scripts.Script):
             self.is_anima = model_name == "Anima"
             self.is_flux = "Flux" in model_name or "Klein" in model_name
 
-            # Both Anima and our new Flux patcher handle prompt extraction completely internally.
-            # Therefore, we MUST return early so the SD1.5/SDXL legacy pipeline below does not run.
             if self.is_anima or self.is_flux:
                 if self.is_anima:
                     patch_anima_negpip(NegPiP)
                 elif self.is_flux:
                     from lib_negpip.flux import patch_flux_negpip
-                    patch_flux_negpip(self, NegPiP)
+                    # FIXED: Now matches the single-argument signature
+                    patch_flux_negpip(NegPiP)
 
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
@@ -181,7 +181,7 @@ class NegPiP(scripts.Script):
         self.is_hr = True
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if (not self.active) or self.is_anima or self.is_flux:
+        if (not self.active) or getattr(self, "is_anima", False) or getattr(self, "is_flux", False):
             return
 
         conds_list = []
