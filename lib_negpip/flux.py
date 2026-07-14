@@ -43,7 +43,6 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         
         _count = 0
 
-        # Helper to process tensors while maintaining exact (Batch, Seq, Dim) shapes
         def process_tensor(txt_tensor):
             nonlocal _count
             if txt_tensor.ndim == 2:
@@ -54,7 +53,6 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             out_mask = []
             
             for i in range(b):
-                # Ensure we match the prompt to the batch index safely
                 line = prompt[i] if i < len(prompt) else prompt[-1]
                 mask = _build_flux_negpip_mask(engine, line, l, txt_tensor.device, txt_tensor.dtype)
                 _count += int((mask < 0).sum())
@@ -64,7 +62,6 @@ def _hook_flux_learned_conditioning(model, remove: bool):
                 
             return torch.stack(out_txt, dim=0), torch.stack(out_mask, dim=0)
 
-        # Preserve the exact return type (Dict or List) so Forge doesn't crash downstream
         if isinstance(conds, dict):
             txt_key = "crossattn" if "crossattn" in conds else "txt"
             if txt_key in conds and conds[txt_key] is not None:
@@ -125,7 +122,6 @@ def _build_flux_negpip_mask(engine, line: str, token_length: int, device, dtype)
     weights = torch.tensor(multipliers, device=device, dtype=dtype)
     ones = torch.ones_like(weights)
     
-    # Dampen the negative weights for Qwen3 to prevent image deep-frying
     mask = torch.where(weights < 0, weights * 0.5, ones)
 
     if mask.shape[0] < token_length:
@@ -180,10 +176,24 @@ def _hook_flux_compile_conditions(remove: bool):
         if cond is None:
             return None
 
-        # 1. Let Forge do the heavy lifting and compile everything natively first
+        # 1. Bypass Forge's compiler if we are dealing with our synthetic dictionary
+        # This prevents the KeyError: 'vector' crash entirely.
+        if isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], dict):
+            if "c_negpip_mask" in cond[0] and "crossattn" in cond[0] and "vector" not in cond[0] and "y" not in cond[0]:
+                compiled = []
+                for c_item in cond:
+                    txt = c_item["crossattn"]
+                    model_conds = {
+                        "c_crossattn": condition.ConditionCrossAttn(txt),
+                        "c_negpip_mask": condition.Condition(c_item["c_negpip_mask"])
+                    }
+                    compiled.append({"crossattn": txt, "model_conds": model_conds})
+                return compiled
+
+        # 2. For all native dictionaries, proceed with standard compilation
         compiled = condition.orig_flux_forward(cond)
         
-        # 2. Inject our mask back into the compiled object if it exists
+        # 3. Inject our mask back into the native compiled object
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
