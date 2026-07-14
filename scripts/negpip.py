@@ -40,37 +40,35 @@ class NegPiP(scripts.Script):
         self.is_hr: bool = False
         self.is_flux: bool = False
 
-        self.tokenizer: torch.nn.Module
+        self.tokenizer: torch.nn.Module = None
 
-        self.has_hr_p: bool
-        self.has_hr_n: bool
-        self.rev: bool
-        self.batch_size: int
+        self.has_hr_p: bool = False
+        self.has_hr_n: bool = False
+        self.rev: bool = False
+        self.batch_size: int = 1
 
-        self.conds: list[torch.Tensor]
-        self.c_len: int
-        self.c_tokens: list[int]
-        self.conds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
-        self.hr_conds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
+        self.conds = None
+        self.c_len: int = 0
+        self.c_tokens = None
+        self.conds_all = None
+        self.hr_conds_all = None
 
-        self.unconds: list[torch.Tensor]
-        self.uc_len: int
-        self.uc_tokens: list[int]
-        self.unconds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
-        self.hr_unconds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
+        self.unconds = None
+        self.uc_len: int = 0
+        self.uc_tokens = None
+        self.unconds_all = None
+        self.hr_unconds_all = None
 
         on_cfg_denoiser(self.denoiser_callback)
 
     def reset(self):
         self.active = False
-
         self.is_xl = False
         self.is_anima = False
         self.is_hr = False
         self.is_flux = False
 
         self.tokenizer = None
-
         self.conds = None
         self.c_tokens = None
         self.conds_all = None
@@ -111,17 +109,21 @@ class NegPiP(scripts.Script):
             self.is_anima = model_name == "Anima"
             self.is_flux = "Flux" in model_name or "Klein" in model_name
 
-            # Anima handles prompt parsing internally, so it exits the pipeline early.
-            # Flux requires the standard token parsing pipeline, so it must continue!
-            if self.is_anima:
-                patch_anima_negpip(NegPiP)
+            # Both Anima and our new Flux patcher handle prompt extraction completely internally.
+            # Therefore, we MUST return early so the SD1.5/SDXL legacy pipeline below does not run.
+            if self.is_anima or self.is_flux:
+                if self.is_anima:
+                    patch_anima_negpip(NegPiP)
+                elif self.is_flux:
+                    from lib_negpip.flux import patch_flux_negpip
+                    patch_flux_negpip(self, NegPiP)
+
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
                 self.active = True
                 return
-        else:
-            self.is_xl = p.sd_model.is_sdxl
 
+        self.is_xl = p.sd_model.is_sdxl
         self.batch_size = p.batch_size
         self.has_hr_p, self.has_hr_n = hr_dealer(p)
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
@@ -161,12 +163,7 @@ class NegPiP(scripts.Script):
         self.c_len = calcChunks(self.tokenizer(p.prompts[0])[1], 75)
         self.uc_len = calcChunks(self.tokenizer(p.negative_prompts[0])[1], 75)
 
-        # Apply specific patchers for Flux vs SD1.5/SDXL
-        if getattr(self, "is_flux", False):
-            from lib_negpip.flux import patch_flux_negpip
-            patch_flux_negpip(self, NegPiP)
-        else:
-            patch_sd_negpip(self, NegPiP)
+        patch_sd_negpip(self, NegPiP)
 
         reset_prompt_cache(p)
         p.extra_generation_params["NegPiP"] = True
@@ -184,7 +181,7 @@ class NegPiP(scripts.Script):
         self.is_hr = True
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if (not self.active) or getattr(self, "is_anima", False):
+        if (not self.active) or self.is_anima or self.is_flux:
             return
 
         conds_list = []
@@ -259,14 +256,7 @@ class NegPiP(scripts.Script):
         _, token_len = self.tokenizer(target[0])
         
         c = cond[0][0].cond
-        if getattr(self, "is_flux", False):
-            if isinstance(c, dict):
-                c_tensor = c.get("crossattn", c.get("txt"))
-            else:
-                c_tensor = c
-            # Flux Qwen3/T5 embeddings extracted safely
-            conds.append(c_tensor[0 : token_len + 2, :])
-        elif getattr(self, "is_xl", False):
+        if getattr(self, "is_xl", False):
             conds.append(c["crossattn"][1 : token_len + 2, :])
         else:
             conds.append(c[1 : token_len + 2, :])
