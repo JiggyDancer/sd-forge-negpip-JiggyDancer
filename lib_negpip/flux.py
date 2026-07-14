@@ -1,12 +1,13 @@
 from functools import wraps
 from typing import TYPE_CHECKING, Optional
-
+import re
 import torch
 import torch.nn.functional as F
 
 from backend.sampling import condition, sampling_function
 from backend import attention 
 from modules import shared
+from lib_negpip.utils import NEG_PATTERN
 
 if TYPE_CHECKING:
     from scripts.negpip import NegPiP
@@ -35,95 +36,122 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         return
 
     model.orig_flux_forward = model.get_learned_conditioning
-    engine = getattr(model, "text_processing_engine_flux", getattr(model, "text_processing_engine", None))
 
     @torch.inference_mode()
     @wraps(model.orig_flux_forward)
     def negpip_flux_conditioning(prompt):
-        # 1. Forge applies negative weights directly to embeddings natively here.
-        conds = model.orig_flux_forward(prompt)
+        prompts = [prompt] if isinstance(prompt, str) else prompt
+
+        clean_prompts = []
+        batch_neg_data = []
+        has_neg = False
+
+        # 1. Manually parse negative words to protect the base LLM embeddings
+        for p_text in prompts:
+            matches = re.findall(NEG_PATTERN, p_text)
+            clean_text = p_text
+            neg_data = []
+            for m in matches:
+                clean_text = clean_text.replace(m, "")
+                core = m.strip("() ")
+                parts = core.split(":")
+                if len(parts) >= 2:
+                    word = parts[0].strip()
+                    try:
+                        weight = float(parts[1].strip())
+                        neg_data.append((word, weight))
+                        has_neg = True
+                    except:
+                        pass
+            clean_prompts.append(clean_text.strip(" ,"))
+            batch_neg_data.append(neg_data)
+
+        # Helper to preserve SdConditioning metadata (prevents 'list' attribute crashes)
+        def make_cond_obj(texts):
+            if hasattr(prompt, "is_negative_prompt"):
+                new_obj = type(prompt)(texts)
+                for k, v in vars(prompt).items():
+                    setattr(new_obj, k, v)
+                return new_obj
+            return texts
+
+        # 2. Compile the clean base prompt (keeps the 'y' pooled vector pure)
+        base_conds = model.orig_flux_forward(make_cond_obj(clean_prompts))
         
+        if not has_neg:
+            return base_conds
+
+        is_dict_return = isinstance(base_conds, dict)
+        cond_list = [base_conds] if is_dict_return else base_conds
         _count = 0
-
-        def process_tensor(txt_tensor):
-            nonlocal _count
-            if txt_tensor.ndim == 2:
-                txt_tensor = txt_tensor.unsqueeze(0)
-                
-            b, l, d = txt_tensor.shape
-            out_txt = []
-            out_mask = []
-            tokens_found = 0
+        
+        # 3. Compile negative words separately and append them to the sequence
+        for i, c_item in enumerate(cond_list):
+            neg_list = batch_neg_data[i]
+            if not neg_list:
+                continue
             
-            for i in range(b):
-                line = prompt[i] if i < len(prompt) else prompt[-1]
-                
-                # Re-parse weights to find exactly which tokens Forge negated
-                weights = _build_flux_negpip_mask(engine, line, l, txt_tensor.device, txt_tensor.dtype)
-                
-                # 2. Undo the negative embedding inversion! 
-                # This restores Q and K to positive so they target the concept accurately with massive force.
-                sign_flip = torch.where(weights < 0, torch.tensor(-1.0, device=weights.device, dtype=weights.dtype), torch.tensor(1.0, device=weights.device, dtype=weights.dtype))
-                
-                # Fix the embeddings
-                fixed_txt = txt_tensor[i] * sign_flip.unsqueeze(-1)
-                
-                out_txt.append(fixed_txt)
-                out_mask.append(sign_flip.unsqueeze(-1))
-                tokens_found += int((weights < 0).sum())
-                
-            return torch.stack(out_txt, dim=0), torch.stack(out_mask, dim=0), tokens_found
+            txt_key = "crossattn" if "crossattn" in c_item else "txt"
+            if txt_key not in c_item:
+                continue
 
-        if isinstance(conds, dict):
-            for k in ["txt", "crossattn"]:
-                if k in conds and conds[k] is not None:
-                    conds[k], mask, c = process_tensor(conds[k])
-                    conds["c_negpip_mask"] = mask
-                    _count += c
-                    break
-        elif isinstance(conds, list):
-            for c_item in conds:
-                if isinstance(c_item, dict):
-                    for k in ["txt", "crossattn"]:
-                        if k in c_item and c_item[k] is not None:
-                            c_item[k], mask, c = process_tensor(c_item[k])
-                            c_item["c_negpip_mask"] = mask
-                            _count += c
-                            break
-        elif isinstance(conds, torch.Tensor):
-            new_txt, mask, c = process_tensor(conds)
-            _count += c
-            conds = {"txt": new_txt, "c_negpip_mask": mask}
+            base_txt = c_item[txt_key]
+            
+            if base_txt.ndim == 2:
+                base_txt = base_txt.unsqueeze(0)
+            
+            b, seq_len, dim = base_txt.shape
+            
+            # Mask for base prompt is all 1.0
+            mask_list = [torch.ones(seq_len, device=base_txt.device, dtype=base_txt.dtype)]
+            txt_list = [base_txt]
+
+            # Handle Flux Positional IDs if they exist
+            has_txt_ids = "txt_ids" in c_item
+            if has_txt_ids:
+                base_txt_ids = c_item["txt_ids"]
+                txt_ids_list = [base_txt_ids]
+            
+            for (word, weight) in neg_list:
+                word_cond = model.orig_flux_forward(make_cond_obj([word]))
+                w_item = word_cond[0] if isinstance(word_cond, list) else word_cond
+                w_txt = w_item[txt_key]
+                if w_txt.ndim == 2:
+                    w_txt = w_txt.unsqueeze(0)
+                    
+                w_seq_len = w_txt.shape[1]
+                txt_list.append(w_txt)
+                
+                # Assign the negative weight to the mask for these appended tokens
+                w_mask = torch.full((w_seq_len,), weight, device=base_txt.device, dtype=base_txt.dtype)
+                mask_list.append(w_mask)
+
+                # Append matching positional IDs
+                if has_txt_ids and "txt_ids" in w_item:
+                    txt_ids_list.append(w_item["txt_ids"])
+
+                _count += 1
+                
+            final_txt = torch.cat(txt_list, dim=1)
+            final_mask = torch.cat(mask_list, dim=0)
+            
+            c_item[txt_key] = final_txt
+
+            # Concatenate txt_ids safely
+            if has_txt_ids and len(txt_ids_list) == len(txt_list):
+                tid_dim = 1 if base_txt_ids.ndim == 3 else 0
+                c_item["txt_ids"] = torch.cat(txt_ids_list, dim=tid_dim)
+
+            # Store mask to be retrieved in the DiT block
+            c_item["c_negpip_mask"] = final_mask.unsqueeze(0).unsqueeze(-1).expand(b, -1, -1)
 
         if _count > 0:
-            key = "Negative" if getattr(prompt, "is_negative_prompt", False) else "Positive"
-            print(f"NegPiP Flux Enable ({key}: {_count})")
+            print(f"NegPiP Flux Enable (Isolated Targets: {_count})")
 
-        return conds
+        return base_conds if not is_dict_return else cond_list[0]
 
     model.get_learned_conditioning = negpip_flux_conditioning
 
-def _build_flux_negpip_mask(engine, line: str, token_length: int, device, dtype):
-    if not engine:
-        return torch.ones(token_length, device=device, dtype=dtype)
-        
-    chunks = engine.tokenize_line(line)
-    multipliers = []
-    
-    for chunk in chunks:
-        multipliers.extend(getattr(chunk, "multipliers", getattr(chunk, "t5_multipliers", [])))
-
-    if not multipliers:
-        return torch.ones(token_length, device=device, dtype=dtype)
-
-    weights = torch.tensor(multipliers, device=device, dtype=dtype)
-
-    if weights.shape[0] < token_length:
-        weights = F.pad(weights, (0, token_length - weights.shape[0]), value=1.0)
-    elif weights.shape[0] > token_length:
-        weights = weights[:token_length]
-
-    return weights
 
 def _hook_flux_dit_forward(dit, remove: bool):
     if remove:
@@ -137,7 +165,7 @@ def _hook_flux_dit_forward(dit, remove: bool):
 
     dit.orig_flux_forward = dit.forward
     
-    # 3. SPLIT ATTENTION HOOK
+    # Global hook for attention that manages scope via shared.state
     if not hasattr(attention, "orig_flux_negpip_attention"):
         attention.orig_flux_negpip_attention = attention.attention_function
 
@@ -148,28 +176,20 @@ def _hook_flux_dit_forward(dit, remove: bool):
             
             if neg_mask is not None:
                 b, s, d = v.shape
-                b_m, txt_len, _ = neg_mask.shape
+                b_m, total_txt_len, _ = neg_mask.shape
                 
                 working_mask = neg_mask.to(v.device, dtype=v.dtype)
                 
                 if b > b_m and b % b_m == 0:
                     working_mask = working_mask.repeat(b // b_m, 1, 1)
                     
-                if s > txt_len:
-                    # SPLIT ATTENTION: This isolates the text stream from the image stream
-                    q_txt, q_img = q[:, :txt_len, :], q[:, txt_len:, :]
-                    
-                    # 1. Text Query: Keep text embeddings 100% pure so it doesn't self-corrupt over 19 layers
-                    out_txt = attention.orig_flux_negpip_attention(q_txt, k, v, heads, mask, *args, **kwargs)
-                    
-                    # 2. Image Query: Negate the Value vectors for the specific negative tokens
-                    v_txt_neg = v[:, :txt_len, :] * working_mask
-                    v_img = v[:, txt_len:, :]
-                    v_neg = torch.cat([v_txt_neg, v_img], dim=1)
-                    
-                    out_img = attention.orig_flux_negpip_attention(q_img, k, v_neg, heads, mask, *args, **kwargs)
-                    
-                    return torch.cat([out_txt, out_img], dim=1)
+                if s == total_txt_len:
+                    v = v * working_mask
+                elif s > total_txt_len:
+                    # ONLY negate the targeted text values, leaving image values pure
+                    v_txt = v[:, :total_txt_len, :] * working_mask
+                    v_img = v[:, total_txt_len:, :]
+                    v = torch.cat([v_txt, v_img], dim=1)
                     
             return attention.orig_flux_negpip_attention(q, k, v, heads, mask, *args, **kwargs)
 
@@ -196,6 +216,7 @@ def _hook_flux_dit_forward(dit, remove: bool):
 
     negpip_forward._negpip = True
     dit.forward = negpip_forward
+
 
 def _hook_flux_compile_conditions(remove: bool):
     if remove:
