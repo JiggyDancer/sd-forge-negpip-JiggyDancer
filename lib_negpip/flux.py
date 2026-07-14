@@ -47,7 +47,6 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         batch_neg_data = []
         has_neg = False
 
-        # 1. Parse negative words out of the prompt cleanly
         for p_text in prompts:
             matches = re.findall(NEG_PATTERN, p_text)
             clean_text = p_text
@@ -67,7 +66,9 @@ def _hook_flux_learned_conditioning(model, remove: bool):
             clean_prompts.append(clean_text.strip(" ,"))
             batch_neg_data.append(neg_data)
 
-        # Safely preserve Forge metadata
+        if not has_neg:
+            return model.orig_flux_forward(prompt)
+
         def make_cond_obj(texts):
             if hasattr(prompt, "is_negative_prompt"):
                 new_obj = type(prompt)(texts)
@@ -77,9 +78,8 @@ def _hook_flux_learned_conditioning(model, remove: bool):
                 return new_obj
             return texts
 
-        # 2. Compile clean prompt (keeps the 'y' pooled vector pristine for CFG 1.0)
         base_conds = model.orig_flux_forward(make_cond_obj(clean_prompts))
-        
+
         is_dict_return = isinstance(base_conds, dict)
         is_tensor_return = isinstance(base_conds, torch.Tensor)
         
@@ -90,19 +90,8 @@ def _hook_flux_learned_conditioning(model, remove: bool):
         else:
             cond_list = [{"txt": c} if isinstance(c, torch.Tensor) else c for c in base_conds]
 
-        # 3. Base Fallback: Ensure mask exists to prevent CFG > 1.0 batching KeyErrors
-        if not has_neg:
-            for c_item in cond_list:
-                if isinstance(c_item, dict) and "c_negpip_mask" not in c_item:
-                    txt_key = "crossattn" if "crossattn" in c_item else "txt"
-                    if txt_key in c_item:
-                        b, s, d = c_item[txt_key].shape if c_item[txt_key].ndim == 3 else (1, c_item[txt_key].shape[0], c_item[txt_key].shape[1])
-                        c_item["c_negpip_mask"] = torch.ones((b, s, 1), device=c_item[txt_key].device, dtype=c_item[txt_key].dtype)
-            return cond_list[0] if is_dict_return or is_tensor_return else cond_list
-
         _count = 0
         
-        # 4. Safely append isolated negative embeddings
         for c_item in cond_list:
             if not isinstance(c_item, dict):
                 continue
@@ -234,14 +223,9 @@ def _hook_flux_dit_forward(dit, remove: bool):
                     working_mask = working_mask.repeat(b // b_m, 1, 1)
                 
                 if s == total_txt_len:
-                    # DOUBLE STREAM: Safe to invert V. Image pushes away from the negative concept.
                     v = v * working_mask
-                    
                 elif s > total_txt_len:
-                    # SINGLE STREAM: Do NOT invert V! It will corrupt the text manifold. 
-                    # Instead, mathematically ZERO OUT the negative tokens so they become invisible.
                     zero_mask = (working_mask > 0).to(v.dtype) 
-                    
                     v_txt = v[:, :total_txt_len, :] * zero_mask
                     v_img = v[:, total_txt_len:, :]
                     v = torch.cat([v_txt, v_img], dim=1)
@@ -288,15 +272,59 @@ def _hook_flux_compile_conditions(remove: bool):
         if cond is None:
             return None
 
-        # Forge safely compiles the native dictionaries
+        # 1. UNWRAP SYNTHETIC DICTIONARIES (Prevents KeyError: 'crossattn')
+        if isinstance(cond, dict) and "c_negpip_mask" in cond and "crossattn" not in cond:
+            mask = cond.pop("c_negpip_mask")
+            txt = cond.pop("txt", None)
+            
+            if len(cond) == 0 and txt is not None:
+                compiled = condition.orig_flux_forward(txt)
+            else:
+                model_conds = {"c_negpip_mask": condition.Condition(mask)}
+                if txt is not None:
+                    model_conds["c_crossattn"] = condition.ConditionCrossAttn(txt)
+                for k, v in cond.items():
+                    model_conds[k] = condition.Condition(v)
+                return [{"crossattn": txt, "model_conds": model_conds}]
+                
+            for c in compiled:
+                if isinstance(c, dict) and "model_conds" in c:
+                    c["model_conds"]["c_negpip_mask"] = condition.Condition(mask)
+            return compiled
+
+        if isinstance(cond, list):
+            is_synthetic = any(isinstance(c, dict) and "c_negpip_mask" in c and "crossattn" not in c for c in cond)
+            if is_synthetic:
+                out = []
+                for c_item in cond:
+                    if isinstance(c_item, dict) and "c_negpip_mask" in c_item and "crossattn" not in c_item:
+                        mask = c_item.pop("c_negpip_mask")
+                        txt = c_item.pop("txt", None)
+                        
+                        if len(c_item) == 0 and txt is not None:
+                            comp = condition.orig_flux_forward(txt)
+                            for c in comp:
+                                if isinstance(c, dict) and "model_conds" in c:
+                                    c["model_conds"]["c_negpip_mask"] = condition.Condition(mask)
+                            out.extend(comp)
+                        else:
+                            model_conds = {"c_negpip_mask": condition.Condition(mask)}
+                            if txt is not None:
+                                model_conds["c_crossattn"] = condition.ConditionCrossAttn(txt)
+                            for k, v in c_item.items():
+                                model_conds[k] = condition.Condition(v)
+                            out.append({"crossattn": txt, "model_conds": model_conds})
+                    else:
+                        out.extend(condition.orig_flux_forward([c_item]) if not isinstance(c_item, list) else condition.orig_flux_forward(c_item))
+                return out
+
+        # 2. NATIVE COMPILE FOR NORMAL OBJECTS
         compiled = condition.orig_flux_forward(cond)
         
-        # Inject the mask payload securely into the final object
         if isinstance(cond, dict) and "c_negpip_mask" in cond:
             for c in compiled:
                 if isinstance(c, dict) and "model_conds" in c:
                     c["model_conds"]["c_negpip_mask"] = condition.Condition(cond["c_negpip_mask"])
-                    
         elif isinstance(cond, list):
             for i, c_item in enumerate(cond):
                 if isinstance(c_item, dict) and "c_negpip_mask" in c_item:
