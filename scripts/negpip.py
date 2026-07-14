@@ -116,7 +116,6 @@ class NegPiP(scripts.Script):
                 elif self.is_flux:
                     from lib_negpip.flux import patch_flux_negpip
                     patch_flux_negpip(NegPiP)
-                    # CFG 1.1 override completely removed
 
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
